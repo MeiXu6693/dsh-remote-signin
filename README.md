@@ -75,7 +75,7 @@ loads it through `REMOTE_SIGNIN` (default `on`; set `off` for upstream's behavio
 through the package's `dsh.bundle` declaration:
 
 ```bash
-dsh plugin --profile web add github:2220545672/dsh-remote-signin
+dsh plugin --profile web add github:MeiXu6693/dsh-remote-signin
 ```
 
 **Or load it as a patch overlay** (no profile change):

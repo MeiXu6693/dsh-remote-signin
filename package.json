@@ -32,12 +32,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/2220545672/dsh-remote-signin.git"
+    "url": "git+https://github.com/MeiXu6693/dsh-remote-signin.git"
   },
   "bugs": {
-    "url": "https://github.com/2220545672/dsh-remote-signin/issues"
+    "url": "https://github.com/MeiXu6693/dsh-remote-signin/issues"
   },
-  "homepage": "https://github.com/2220545672/dsh-remote-signin#readme",
+  "homepage": "https://github.com/MeiXu6693/dsh-remote-signin#readme",
   "keywords": [
     "dsh",
     "deepseek-harness",

@@ -70,7 +70,7 @@ DSH 会把**「你此刻打开界面的地址」**原样交给 DeepSeek 平台�
 `cordis.patch.yml`）：
 
 ```bash
-dsh plugin --profile web add github:2220545672/dsh-remote-signin
+dsh plugin --profile web add github:MeiXu6693/dsh-remote-signin
 ```
 
 **或以 patch overlay 方式加载**（不动 profile）：
