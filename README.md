@@ -1,166 +1,74 @@
-**English** · [中文](README.zh-CN.md)
+# DSH 远程账号登录插件
 
-# dsh-remote-signin
+**中文** · [English](README.en.md)
 
-A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) plugin that
-**lets a DeepSeek *account* sign-in finish in the browser in front of you** — over the
-LAN, a reverse-proxied domain, or Tailscale. All it adds is one paste, into a box that
-appears in the page by itself.
+在另一台设备的浏览器中使用 [DeepSeek Harness（DSH）](https://github.com/deepseek-ai/deepseek-harness) 时，这个插件帮助你完成 DeepSeek **账号登录**。它适用于通过局域网、Tailscale 或反向代理访问 DSH 的场景。
 
-## What you are seeing
+登录过程中，你需要把一次打不开的回调页面地址粘贴回 DSH 页面。插件会自动显示粘贴框。使用 API Key 不需要这一步。
 
-You open DSH on a machine that is **not** the one running it — `http://192.168.0.20:8080`,
-`https://dsh.example.com`, `http://100.x.y.z:8080` — and then:
+## 什么时候需要它
 
-1. you open the account panel and press **Sign in with a DeepSeek account**;
-2. **no login page ever appears**: the dialog fails instead, with something like
-   *"Could not complete the operation. Try again."* — sometimes *"Could not complete the
-   operation. It may be a network problem — check your connection and try again."*;
-3. the same click works when the browser runs **on that machine**, or when you first
-   tunnel the port to yourself with `ssh -L` and open `http://127.0.0.1:…`;
-4. an **API key** is unaffected.
+DSH 运行在服务器或 NAS 上，而浏览器运行在你的电脑或其他设备上时，账号登录可能在打开登录页之前失败。当前 DeepSeek 账号授权要求回调地址使用本机地址；远程浏览器和 DSH 服务器的“本机”不是同一台机器。
 
-So the workarounds have always been: use an API key, or open a tunnel every time you sign
-in. This plugin exists for that one step.
+如果你使用 [dsh-docker 容器镜像](https://github.com/MeiXu6693/dsh-docker)，镜像已包含本插件，默认开启，无需再次安装。通过 Unraid 的 DSH 应用安装时也是如此。
 
-## What the plugin does
+## 怎么使用
 
-With it installed, a remote browser finishes an account sign-in as normal:
+1. 在远程浏览器打开 DSH，选择 **使用 DeepSeek 账号登录**。
+2. 在打开的 DeepSeek 登录页面完成登录。
+3. 浏览器会跳转到一个以 `http://127.0.0.1:47821/` 开头、通常打不开的地址。复制地址栏中的完整地址。
+4. 回到原来的 DSH 页面，将地址粘贴到自动出现的面板中，按提示提交。
+5. DSH 自己验证并完成登录。登录请求通常约 10 分钟后过期；超时或容器重建后，请重新发起登录。
 
-```
-1. browser (https://dsh.example.com)  you press "Sign in with a DeepSeek account"
-2. DSH host + this plugin             registers a 127.0.0.1 address instead of yours
-3. platform.deepseek.com              accepts it, returns the login page
-4. browser                            the login page opens (this is where it used to
-                                      fail), you sign in there
-5. browser                            the platform sends you to 127.0.0.1:47821 — a page
-                                      that cannot load, but the address bar holds the
-                                      authorization code (`code` and `state`)
-6. DSH page                           a paste box has appeared by itself, bottom right:
-                                      paste that address into it
-7. DSH host                           completes the sign-in — the validation and the token
-                                      exchange are DSH's own → the dialog turns green
-```
+回调地址包含敏感的登录信息，只粘贴到你自己 DSH 页面上的面板，不要分享或提交到日志、工单。默认的 `47821` 端口不需要开放；请确保本机没有其他程序占用它，避免回调被其他程序接收。
 
-**Why step 6 cannot be automatic:** the code has to be delivered to that `127.0.0.1`
-address *by your browser*, and your browser is precisely the thing that cannot reach it.
-(If it could, you would be on the machine already and would not need this plugin.) What
-can be removed has been: no address to remember, no second page to open, no hosts file to
-edit — the box shows up when it is needed.
+## 安装与关闭
 
-## Why it cannot work without it
+**dsh-docker 镜像：** 插件已经安装，`REMOTE_SIGNIN` 默认为 `on`。设为 `off` 并重建容器可关闭插件；这时远程账号登录回到上游行为。使用其他镜像时，请先确认镜像是否已集成该插件。
 
-DSH hands the platform **the address you are browsing from** and asks it to deliver the
-login there; the platform only accepts a *local* address (`127.0.0.1` and friends). So the
-request is refused before a login page is ever opened — **nothing to do with your network,
-firewall or reverse proxy**; it is an upstream restriction.
-
-Measured 2026-10-16 against the real platform (`POST /auth-api/v0/dsh/auth_init`):
-
-| callback address given to the platform | platform answer |
-|---|---|
-| `http://127.0.0.1:47821/oauth/callback` | `{"code":0, … "authorize_url": …}`, `expires_in: 600` |
-| `https://dsh.example.com/oauth/callback` | `{"code":50005,"msg":"PAYLOAD_SCHEMA_MISMATCH"}` |
-
-What the plugin splits is those two halves: the platform only validates a **string**, and
-the only thing that has to reach the address in it is the **browser**. The plugin supplies
-the string (a port on `127.0.0.1`, where **nothing listens**); you hand the code back.
-
-## Install
-
-**Unraid / the `dsh-unraid` image** — nothing to do; the image installs this plugin and
-loads it through `REMOTE_SIGNIN` (default `on`; set `off` for upstream's behaviour).
-
-**Any DSH profile** — install it into the profile, which picks up `cordis.patch.yml`
-through the package's `dsh.bundle` declaration:
+**其他 DSH 安装：** 将插件安装到 DSH 的 web profile：
 
 ```bash
 dsh plugin --profile web add github:MeiXu6693/dsh-remote-signin
 ```
 
-**Or load it as a patch overlay** (no profile change):
+也可以在插件已安装且可被 Node 解析时，以 patch overlay 加载：
 
 ```bash
 dsh --profile web --patch "$(node -p "require.resolve('dsh-remote-signin/cordis.patch.yml')")"
 ```
 
-## Settings
+## 常见问题
 
-One setting: which `127.0.0.1` address to register. The default works; you rarely need to
-touch it.
-
-| Source | Meaning |
+| 现象 | 处理方法 |
 |---|---|
-| `config.claimOrigin` in the patch entry | Highest priority. |
-| `REMOTE_SIGNIN_ORIGIN` | Environment fallback. Must be `http://` + `127.0.0.1` / `localhost` / `[::1]` + an explicit port. |
-| default | `http://127.0.0.1:47821` |
+| 点击账号登录后仍然报错 | 确认插件已安装并开启；检查 `docker logs <容器名> \| grep remote-signin` 是否显示 active，或是否说明插件未加载。 |
+| 登录后停在打不开的本机地址，不知道下一步 | 回到原来的 DSH 标签页，把地址栏中的完整地址粘贴到自动出现的面板。 |
+| DSH 页面没有粘贴面板 | 检查插件是否 active；面板未加载时不能通过本插件完成回传，可暂用 API Key 或 SSH 隧道。 |
+| 面板提示没有等待中的登录或 state 不匹配 | 登录可能已过期、容器已重建，或复制的是另一次请求的地址。在当前 DSH 页面重新发起登录并使用新地址。 |
 
-The port is deliberately an odd one: if something of yours did listen there, it would be
-handed the authorization code — so do not point it at a port you use.
+## 工作原理与安全
 
-## What it deliberately does not do
+插件向 DeepSeek 注册一个回环地址，让远程账号登录请求能够开始。登录后，面板从粘贴的地址中提取 `code` 和 `state`，仅发送到当前 DSH 站点自己的 `/oauth/callback`。DSH 原有的一次性 state 检查和 PKCE 校验继续负责验证及令牌交换；插件不保存或记录授权码、state 和令牌。
 
-* **It does not relax any validation.** The callback that completes the sign-in is DSH's
-  own route, with its one-time `state` check and the PKCE verifier it keeps in memory;
-  this plugin only chooses which loopback *string* is registered.
-* **It does not touch a browser that is already on `127.0.0.1`** (`ssh -L`, the desktop
-  app): those origins pass through untouched, exactly as upstream behaves.
-* **It does not invent a look.** The panel is styled from the harness's own design tokens
-  (`--dsw-*`: surface, radius, elevation, label and state colours, primary button fill),
-  so it follows the app's theme — including a user-chosen dark mode — and any future
-  restyle. A test fails if a hard-coded colour creeps back in.
-* **It does not store or log the code, the state or the token.** One line per attempt,
-  naming the address it registered. The pasted address is parsed in your browser, and only
-  `code` and `state` are re-encoded and sent to *this origin's own* `/oauth/callback` —
-  nowhere else, so the panel cannot be used as a redirector.
-* **It does not open a port.** The registration is a string; nothing listens on it, on the
-  server or on your machine.
-* **It never becomes the reason a container will not start.** A missing asset, an unusable
-  address, or a future upstream rename leaves DSH running with upstream behaviour and one
-  line in the log.
+插件不启动监听端口。已通过 `127.0.0.1` 访问的本机浏览器保持原有行为；插件所需服务或资源缺失时会记录提示并回退到上游行为，DSH 仍可启动。
 
-## Troubleshooting
+2026-10-16 的平台测试中，`http://127.0.0.1:47821/oauth/callback` 被接受，而公网 HTTPS 回调被拒绝。这是当时的上游行为，平台规则可能改变。
 
-| Symptom | What it means |
-|---|---|
-| Still *"Could not complete the operation. Try again."* | The plugin is not active: `docker logs <container> \| grep remote-signin` says why (`off`, a missing package, `INACTIVE`). |
-| The login page opens, but afterwards the dead `127.0.0.1` page has no paste box | The panel was not injected — same log line. The panel is the only way back; without it the sign-in cannot be finished. |
-| The panel says **no sign-in is waiting** (`404`) | The attempt expired (~10 minutes), or it belonged to a **different DSH instance** — recreating the container throws it away, and a tab left open from the previous instance still *looks* like it is waiting. Press **Sign in** again in the tab you are actually using. |
-| The panel says the state does not match (`400`) | The address came from a different attempt, or the code was already consumed. |
-| You want upstream behaviour back | Remove the plugin (or set `REMOTE_SIGNIN=off` on the `dsh-unraid` image), and go back to an API key or a tunnel. |
+## 高级配置
 
-## Development
+默认声明地址是 `http://127.0.0.1:47821`，通常无需修改。patch 条目的 `config.claimOrigin` 优先；没有该项时读取 `REMOTE_SIGNIN_ORIGIN`。地址必须使用 `http://`、回环主机（`127.0.0.1`、`localhost` 或 `[::1]`）和显式端口。不要选择本机已有程序使用的端口。
+
+通过 patch 条目按包名加载时，插件必须能从 DSH 安装的依赖或 profile 的 `node_modules` 解析。安装在其他位置时，可以使用插件入口的绝对 `file://` 地址；dsh-docker 镜像使用这种方式。
+
+## 开发与兼容性检查
 
 ```bash
-node --test        # 16 tests, no dependencies, no browser
+node --test
 ```
 
-| File | Purpose |
-|---|---|
-| `src/index.js` | Server plugin: wraps `deepseekAccount.startSignIn` (a non-loopback browser origin becomes the registered loopback origin), serves the panel script, injects it into the DSH document. |
-| `src/claim.js` | Pure functions: how an address is parsed and validated — testable without booting DSH. |
-| `assets/inpage.js` | The panel. It appears only while a sign-in waits, which it learns from the status of `GET /oauth/callback` (`400` = waiting, `404` = idle) — no new endpoint. |
-| `test/`, `test-support/` | The `node --test` suites and the small DOM stub they share (probe cadence, dismissal, address extraction and every status are covered). |
+单元测试使用 Node 内置测试工具和 DOM 桩，不需要网络、浏览器或安装依赖。CI 同时定期拉取 `ghcr.io/meixu6693/dsh:latest`，验证镜像内置插件和当前仓库代码与最新镜像是否兼容，包括加载、认证门禁、面板注入及资源、空闲回调、禁用和 edge 来源校验。CI 不使用真实 DeepSeek 账号，也不完成平台授权；浏览器交互由本仓库的无依赖单元测试覆盖。
 
-### One caveat about where the package lives
+检查每小时调度一次，也会在 push、PR 和手动运行时执行。GitHub 定时任务可能延迟；通知依赖仓库现有的 Actions 通知设置。测试结果可在 [Actions](https://github.com/MeiXu6693/dsh-remote-signin/actions) 查看。
 
-A patch entry's `name` is resolved from two anchors: the packages carried by the
-`@deepseek-ai/dsh` **installation** (its dependency closure), and the **profile**
-directory (`$DSH_HOME/profiles/<name>/node_modules`). A package installed anywhere else —
-a dependency of your own runtime manifest, or a copy in an image — is in neither, and
-`name: dsh-remote-signin` then fails with `ERR_MODULE_NOT_FOUND`. Two ways out:
-
-* install into the profile (`dsh plugin … add …`, above), where the name resolves; or
-* point the entry at the file, as the `dsh-unraid` image does:
-
-  ```yaml
-  - insert:
-      - id: remote-signin
-        name: file:///app/node_modules/dsh-remote-signin/src/index.js
-  ```
-
-Upstream is in developer preview. The plugin depends on two contracts only —
-`deepseekAccount.startSignIn` and the web server's route/index APIs — and degrades rather
-than breaks when either changes.
-
-MIT licensed. See [CHANGELOG.md](CHANGELOG.md).
+MIT 许可；版本历史见 [CHANGELOG.md](CHANGELOG.md)。
