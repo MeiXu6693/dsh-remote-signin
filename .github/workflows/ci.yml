@@ -1,33 +1,36 @@
 name: ci
 
-# The whole suite is `node --test` against a stub DOM: no browser, no build, no network,
-# so it runs everywhere and finishes in well under a second. Both the oldest supported
-# line and the current one, because the assets run in whatever browser the operator has
-# and the server half runs in whatever Node DSH ships on.
+# The Node unit suite stays offline and dependency-free. A separate integration
+# job pulls the public DSH image so upstream and packaging changes are detected.
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: '37 * * * *'
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   test:
     name: node ${{ matrix.node }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
         node: ['22', '24']
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node }}
-
+          package-manager-cache: false
       - name: Syntax of every shipped file
         run: |
           set -euo pipefail
@@ -35,10 +38,8 @@ jobs:
             node --check "${file}"
             printf 'node --check ok: %s\n' "${file}"
           done
-
+          bash -n scripts/test-dsh-image.sh
       - name: The loader entry says insert
-        # A bare row targets an existing entry by id, so the loader would warn and carry
-        # on — the plugin would simply never load. Cheap to assert, silent to get wrong.
         run: |
           set -euo pipefail
           node -e '
@@ -48,7 +49,6 @@ jobs:
             if (!/name:\s*dsh-remote-signin\s*$/m.test(text)) { console.error("cordis.patch.yml must name this package"); process.exit(1); }
             console.log("cordis.patch.yml loads dsh-remote-signin through insert:");
           '
-
       - name: Package manifest is coherent
         run: |
           set -euo pipefail
@@ -61,6 +61,19 @@ jobs:
             if (missing.length > 0) { console.error("package.json points at missing files:", missing); process.exit(1); }
             console.log("package.json:", pkg.name, pkg.version);
           '
-
       - name: Tests
         run: node --test
+
+  dsh-image:
+    name: DSH latest image compatibility
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - name: Pull latest DSH image
+        run: |
+          set -euo pipefail
+          docker pull ghcr.io/meixu6693/dsh:latest
+          docker image inspect --format 'image={{index .RepoDigests 0}}' ghcr.io/meixu6693/dsh:latest
+      - name: Test bundled and checked-out plugins
+        run: bash scripts/test-dsh-image.sh ghcr.io/meixu6693/dsh:latest
