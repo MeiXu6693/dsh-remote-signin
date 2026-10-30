@@ -2,6 +2,23 @@
 
 Versions are what the `dsh-unraid` image pins, so a tag here is a deployment there.
 
+## 0.2.3 — 2026-10-30
+
+* **An idle page no longer makes a failing request every three seconds.** The panel used
+  to poll upstream's `/oauth/callback` on a timer and read `404` as "nothing is waiting".
+  That answer is correct, but it left a 404 in the browser console every three seconds for
+  as long as DSH stayed open — measured on this host: 16 977 of them in one access log,
+  none of which was an event. The plugin now serves `/remote-signin/state`: `200` while
+  one of upstream's sign-in attempts is in flight, `204` otherwise. The panel reads the
+  callback only after a `200`, so an idle page makes no request a devtools would flag.
+* The state route reports what the wrapper can actually see — the in-flight `startSignIn`
+  promise, which settles when the attempt ends — rather than a guess with an expiry, so
+  the answer returns to `204` by itself.
+* A server build without the route answers `404` and the panel falls back to probing the
+  callback itself, so an older server half keeps the newer panel working (and vice versa).
+* A live profile reload that re-applies the plugin reuses the counter the installed
+  wrapper moves; a fresh one would have read `204` forever.
+
 ## 0.2.2 — 2026-10-30
 
 * **The panel no longer appears by itself and claims a sign-in it did not see.** Behind

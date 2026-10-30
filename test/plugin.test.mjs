@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { PANEL_PATH, apply } from "../src/index.js";
+import { PANEL_PATH, STATE_PATH, apply } from "../src/index.js";
 
 /**
  * A Cordis context stub recording everything the plugin touches.
@@ -14,10 +14,12 @@ function fakeContext() {
   class FakeAccount {
     constructor() {
       this.calls = [];
+      /** Set to a promise to model an attempt that is still in flight. */
+      this.answer = undefined;
     }
     startSignIn(client, callbackOrigin, loginSource) {
       this.calls.push({ client, callbackOrigin, loginSource });
-      return { ok: true };
+      return this.answer ?? { ok: true };
     }
   }
   const service = new FakeAccount();
@@ -84,8 +86,8 @@ test("apply claims a remote origin, leaves loopback alone, and serves the panel"
     ["http://127.0.0.1:47821", "http://127.0.0.1:3081"],
   );
 
-  // Exactly one path is served: the panel script the document injects.
-  assert.deepEqual([...routes.keys()], [PANEL_PATH]);
+  // The panel script and the attempt state it polls: nothing else is served.
+  assert.deepEqual([...routes.keys()].sort(), [PANEL_PATH, STATE_PATH].sort());
 
   const panel = fakeResponse();
   routes.get(PANEL_PATH).handler({ method: "GET" }, panel);
@@ -103,6 +105,53 @@ test("apply claims a remote origin, leaves loopback alone, and serves the panel"
   const post = fakeResponse();
   routes.get(PANEL_PATH).handler({ method: "POST" }, post);
   assert.equal(post.written.status, 405);
+});
+
+test("the state route reports an attempt only while a sign-in is in flight", async () => {
+  const { ctx, service, routes } = fakeContext();
+  apply(ctx, { claimOrigin: "http://127.0.0.1:47821" });
+  const state = routes.get(STATE_PATH);
+
+  const idle = fakeResponse();
+  state.handler({ method: "GET" }, idle);
+  assert.equal(idle.written.status, 204, "no attempt in flight answers 204, so an idle page has nothing to log");
+  assert.equal(idle.written.headers["cache-control"], "no-store");
+
+  let settle;
+  service.answer = new Promise((resolve) => {
+    settle = resolve;
+  });
+  const inFlight = service.startSignIn({}, "https://dsh.example.com", "web");
+  const waiting = fakeResponse();
+  state.handler({ method: "GET" }, waiting);
+  assert.equal(waiting.written.status, 200, "an attempt in flight makes the panel read the callback");
+
+  settle({ ok: true });
+  await inFlight;
+  const after = fakeResponse();
+  state.handler({ method: "GET" }, after);
+  assert.equal(after.written.status, 204, "the attempt ended, so the answer goes back to 204");
+
+  const post = fakeResponse();
+  state.handler({ method: "POST" }, post);
+  assert.equal(post.written.status, 405);
+});
+
+test("a live profile reload keeps the counter the installed wrapper moves", async () => {
+  const { ctx, service, routes } = fakeContext();
+  apply(ctx, { claimOrigin: "http://127.0.0.1:47821" });
+  apply(ctx, { claimOrigin: "http://127.0.0.1:47821" });
+
+  let settle;
+  service.answer = new Promise((resolve) => {
+    settle = resolve;
+  });
+  const inFlight = service.startSignIn({}, "https://dsh.example.com", "web");
+  const state = fakeResponse();
+  routes.get(STATE_PATH).handler({ method: "GET" }, state);
+  assert.equal(state.written.status, 200, "a fresh counter in the second apply would always read 204");
+  settle({ ok: true });
+  await inFlight;
 });
 
 test("apply injects the panel into the DSH document", () => {

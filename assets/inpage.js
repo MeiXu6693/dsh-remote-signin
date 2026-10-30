@@ -5,18 +5,19 @@
  * for a waiting sign-in and, when there is one, offers the paste step right where the
  * operator already is: no jump to another page, no second tab, nothing to remember.
  *
- * How "a sign-in is waiting" is detected without any extra endpoint: upstream
- * registers `/oauth/callback` on the web server exactly while an attempt waits, and
- * answers 400 to a request without `code`/`state`. With no attempt the path is not
- * registered at all and the fallback seat answers 404. So the probe is free of side
- * effects and needs no API of ours.
+ * How "a sign-in is waiting" is detected: the plugin serves `/remote-signin/state`, which
+ * answers `200` while one of upstream's sign-in attempts is in flight and `204` otherwise.
+ * Only when it says `200` does this panel look at upstream's `/oauth/callback`, which
+ * answers `400` for a request without `code`/`state` exactly while the attempt waits (and
+ * `404` once it is gone). Asking the callback directly, every three seconds from an idle
+ * page, was correct but made the browser console report a failed request forever; the
+ * state route answers the same question without producing one.
  *
- * Only those two answers are read as state. A redirect is deliberately *not*: upstream
- * answers the request that carries the code with its own redirect, and this probe never
- * carries one, so a redirect here comes from whatever sits in front of DSH (an SSO or
- * reverse proxy answering an unauthenticated request). Treating that as "somebody
- * finished the sign-in" made the panel appear unasked, claiming the login was done,
- * whenever the operator's proxy session had lapsed.
+ * A redirect is deliberately never read as state: upstream answers the request that
+ * carries the code with its own redirect, and neither of these probes carries one, so a
+ * redirect comes from whatever sits in front of DSH (an SSO or reverse proxy answering an
+ * unauthenticated request). Treating that as "somebody finished the sign-in" made the
+ * panel appear unasked, claiming the login was done, whenever the proxy session lapsed.
  *
  * The extraction and the status vocabulary are exercised by test/inpage.test.mjs, which
  * runs this file against a small DOM stub: no browser, no build step.
@@ -25,6 +26,7 @@
   "use strict";
 
   var CALLBACK = "/oauth/callback";
+  var STATE = "/remote-signin/state";
   var IDLE_MS = 3000;
   var WAITING_MS = 2000;
   var zh = /^zh/i.test((navigator && navigator.language) || "en");
@@ -37,6 +39,7 @@
   var waiting = false;
   var dismissed = false;
   var succeeded = false;
+  var stateKnown = true; // false once a server without /remote-signin/state says 404
 
   /**
    * Pull `code` and `state` out of whatever was pasted: a full URL, a bare query
@@ -330,24 +333,53 @@
   }
 
   /**
-   * One probe: 400 means an attempt is waiting (upstream's callback route exists and
-   * rejected a request without code/state); 404 means it does not exist at all.
-   * Anything else — a redirect in particular — says nothing about the sign-in and is
-   * read as "not waiting", never as "signed in".
+   * Ask this plugin's own state route whether an attempt may be waiting, and read
+   * upstream's callback only when it says one might be.
+   *
+   * The state route answers `200` (an attempt is in flight) or `204` (nothing is) and
+   * never an error, so an idle page makes no request a devtools console would flag — the
+   * old design asked `/oauth/callback` every three seconds and got a `404` each time,
+   * which is correct but reads as a broken page. A `404` from the state route means a
+   * server build without it: fall back to reading the callback itself, which is what this
+   * panel did before the route existed.
    */
-  function probe() {
-    if (document.visibilityState === "hidden") {
-      schedule(IDLE_MS);
-      return;
-    }
-    fetch(CALLBACK, { method: "GET", credentials: "same-origin", redirect: "manual", cache: "no-store" })
-      .then(function (response) {
+  function probeState() {
+    return fetch(STATE, { method: "GET", credentials: "same-origin", redirect: "manual", cache: "no-store" }).then(
+      function (response) {
+        if (isRedirect(response)) {
+          // The SSO or reverse proxy in front of DSH answered, not DSH: nothing is known.
+          goIdle();
+          return IDLE_MS;
+        }
+        if (response.status === 200) return probeCallback();
+        if (response.status === 404) {
+          stateKnown = false;
+          return probeCallback();
+        }
+        // 204, and anything else: no attempt is waiting.
+        goIdle();
+        return IDLE_MS;
+      },
+    );
+  }
+
+  /**
+   * Upstream's own answer for "is an attempt waiting": `400` means the callback route is
+   * registered and rejected a request without `code`/`state`; `404` means it is not
+   * registered at all. Anything else — a redirect in particular — says nothing about the
+   * sign-in and is read as "not waiting", never as "signed in".
+   *
+   * @returns a promise of how long to wait before the next poll.
+   */
+  function probeCallback() {
+    return fetch(CALLBACK, { method: "GET", credentials: "same-origin", redirect: "manual", cache: "no-store" }).then(
+      function (response) {
         if (isRedirect(response)) {
           // Upstream answers the request carrying the code with its redirect; this probe
           // carries none, so an SSO or reverse proxy in front of DSH answered instead.
           // Nothing happened to the sign-in: keep the panel out of the way.
           goIdle();
-          return;
+          return IDLE_MS;
         }
         if (response.status === 400) {
           if (!waiting) {
@@ -359,15 +391,26 @@
             setStatus("", "");
           }
           if (!dismissed) show();
-          return;
+          return WAITING_MS;
         }
         // 404 and anything else: no attempt is waiting.
         goIdle();
-      })
-      .catch(goIdle)
-      .then(function () {
-        schedule(waiting ? WAITING_MS : IDLE_MS);
-      });
+        return IDLE_MS;
+      },
+    );
+  }
+
+  /** One poll: settle the attempt state first, then look at the callback if it may wait. */
+  function probe() {
+    if (document.visibilityState === "hidden") {
+      schedule(IDLE_MS);
+      return;
+    }
+    var next = stateKnown ? probeState() : probeCallback();
+    next.then(schedule, function () {
+      goIdle();
+      schedule(IDLE_MS);
+    });
   }
 
   var timer = null;

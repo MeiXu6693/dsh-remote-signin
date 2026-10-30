@@ -1,6 +1,6 @@
 {
   "name": "dsh-remote-signin",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Let a remote browser finish the DeepSeek account sign-in: claims the loopback redirect the platform requires, then brings the authorization code back through a paste panel injected into the DSH page.",
   "type": "module",
   "license": "MIT",
