@@ -12,6 +12,17 @@ measurements that justify the design, and the rules the code is not allowed to b
 | `assets/inpage.js` | The in-page panel (client) — the only way the code comes back. |
 | `cordis.patch.yml` | The loader entry a profile or `--patch` overlay picks up. |
 | `test/`, `test-support/` | `node --test` suites and the DOM stub they share. |
+| `scripts/report-ci-failure.mjs` | Files the issue that tracks a red `ci` run (see CI below). |
+
+## CI
+
+`ci` runs on push, on pull requests, hourly, and on demand. A red run is recorded by
+`.github/workflows/ci-failure-issue.yml`, a separate `workflow_run` workflow so the job
+under test never holds `issues: write`: it keeps one issue per default branch, refreshed
+with the failing run, commit and jobs on every failure, and comments and closes it on
+the next green run. Pull-request runs are not tracked — the pull request already carries
+their result. The issue text lives in `scripts/report-ci-failure.mjs`; keep
+`test/ci-failure-issue.test.mjs` (a stub API, no network) in step with it.
 
 ## Rules
 

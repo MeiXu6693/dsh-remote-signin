@@ -1,0 +1,44 @@
+name: ci failure issue
+
+# A red `ci` run has to leave a trace in this repository. This workflow turns the
+# `workflow_run` of `ci` into one issue per default branch: the first failure opens it,
+# later failures refresh its body, and the next green run comments and closes it — an
+# hourly workflow must not open a new issue every hour.
+#
+# Kept out of `ci.yml` on purpose: the job under test must not hold `issues: write`.
+# A `workflow_run` workflow always runs from the default branch and gets a write token,
+# whatever ref the triggering run came from.
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+  issues: write
+
+concurrency:
+  group: ci-failure-issue
+  cancel-in-progress: false
+
+jobs:
+  report:
+    name: report
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Open, refresh or close the tracking issue
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          CI_EVENT: ${{ github.event.workflow_run.event }}
+          CI_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          CI_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          CI_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          CI_RUN_ID: ${{ github.event.workflow_run.id }}
+          CI_RUN_URL: ${{ github.event.workflow_run.html_url }}
+          CI_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          CI_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: node scripts/report-ci-failure.mjs

@@ -38,6 +38,7 @@ jobs:
             node --check "${file}"
             printf 'node --check ok: %s\n' "${file}"
           done
+          node --check scripts/report-ci-failure.mjs
           bash -n scripts/test-dsh-image.sh
       - name: The loader entry says insert
         run: |
