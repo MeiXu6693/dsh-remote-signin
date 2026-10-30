@@ -24,6 +24,13 @@ the next green run. Pull-request runs are not tracked — the pull request alrea
 their result. The issue text lives in `scripts/report-ci-failure.mjs`; keep
 `test/ci-failure-issue.test.mjs` (a stub API, no network) in step with it.
 
+The image job (`scripts/test-dsh-image.sh`) waits up to 20 s for the plugin's activation
+line: `/healthz` proves Caddy and DSH are up, not that the plugin applied, and a single
+grep once raced that. When a case fails it prints evidence instead of the whole log —
+the entrypoint's and plugin's own lines, the mounts, and whether uid 1000 can read and
+import the plugin. Never widen that to lines DSH prints itself: they can carry one-time
+bootstrap credentials and the job log is public.
+
 ## Rules
 
 1. **Fail soft, never fail the boot.** DSH is the product; this plugin is a convenience.
