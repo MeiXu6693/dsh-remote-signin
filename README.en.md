@@ -51,7 +51,7 @@ dsh --profile web --patch "$(node -p "require.resolve('dsh-remote-signin/cordis.
 
 The plugin registers a loopback address with DeepSeek so a remote sign-in can start. The panel extracts `code` and `state` from the pasted address and sends them only to the current DSH site's own `/oauth/callback`. DSH's existing one-time state check and PKCE validation still perform verification and token exchange; the plugin does not store or log the code, state or tokens.
 
-The plugin does not open a listening port. Browsers already accessing DSH through `127.0.0.1` keep upstream behavior. If a required service or asset is unavailable, the plugin reports it and falls back to upstream behavior while DSH continues to start.
+The plugin does not open a listening port. Browsers already accessing DSH through `127.0.0.1` keep upstream behavior. If a required service or asset is unavailable, the plugin reports it and falls back to upstream behavior while DSH continues to start. The panel reads only `400` (a sign-in waits) and `404` (idle) as state; **a redirect is not state** — DSH redirects only the request that carries the code, which the panel's probe never does, so a redirect there came from the SSO or reverse proxy in front of DSH and says nothing about the sign-in.
 
 In a platform test on 2026-10-16, `http://127.0.0.1:47821/oauth/callback` was accepted while a public HTTPS callback was rejected. This records upstream behavior at that time; platform rules may change.
 

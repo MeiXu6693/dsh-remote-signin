@@ -80,6 +80,40 @@ test("an attempt later on shows the panel again, dismissal and all", async () =>
   assert.notEqual(panel(dom.document).style.display, "none", "a new attempt must show the panel again");
 });
 
+test("a redirect from the proxy in front of DSH is not a sign-in, let alone a finished one", async () => {
+  // SWAG/Authelia answer an unauthenticated request with a 302 to the SSO page; the
+  // browser's `redirect: "manual"` fetch sees only an opaque redirect. Reading that as
+  // "somebody completed the sign-in" is what made this panel appear unasked.
+  const dom = await boot([{ status: 0, type: "opaqueredirect" }]);
+  assert.equal(panel(dom.document), null, "a proxy redirect must not build the panel");
+  assert.equal(dom.calls.length, 1, "nothing else is fetched to decide it");
+});
+
+test("a redirect while an attempt waited hides the panel instead of claiming success", async () => {
+  const dom = await boot([{ status: 400, type: "basic" }, { status: 0, type: "opaqueredirect" }]);
+  assert.notEqual(panel(dom.document).style.display, "none");
+  await dom.flushTimers();
+  assert.equal(panel(dom.document).style.display, "none", "a redirect is 'cannot see', not 'signed in'");
+  assert.doesNotMatch(statusLine(dom.document).textContent, /登录完成/);
+});
+
+test("a new attempt starts with a clean status line", async () => {
+  const dom = await boot([
+    { status: 400, type: "basic" }, // attempt 1 waits
+    { status: 400, type: "basic" }, // its code was rejected
+    { status: 404, type: "basic" }, // the attempt ends
+    { status: 400, type: "basic" }, // attempt 2
+  ]);
+  textarea(dom.document).value = "http://127.0.0.1:47821/oauth/callback?code=abc&state=def";
+  submitButton(dom.document).click();
+  await settle();
+  assert.match(statusLine(dom.document).textContent, /state 不匹配/);
+  await dom.flushTimers(); // → 404: nothing waits any more
+  await dom.flushTimers(); // → 400: a new attempt
+  assert.notEqual(panel(dom.document).style.display, "none");
+  assert.equal(statusLine(dom.document).textContent, "", "the previous attempt's answer must not carry over");
+});
+
 test("a pasted callback address is sent to the same origin and reported", async () => {
   const good = "http://127.0.0.1:47821/oauth/callback?code=abc&state=def";
   const cases = [
@@ -91,6 +125,8 @@ test("a pasted callback address is sent to the same origin and reported", async 
     [new Error("network down"), "没有到达 DSH", "error"],
   ];
   for (const [answer, needle, kind] of cases) {
+    // The probe, the submitted code, then the confirmation probe a redirect triggers
+    // (the queue's fallback 404 answers it: the route is gone, so DSH completed it).
     const dom = await boot([{ status: 400, type: "basic" }, answer]);
     textarea(dom.document).value = good;
     submitButton(dom.document).click();
@@ -101,6 +137,24 @@ test("a pasted callback address is sent to the same origin and reported", async 
     assert.equal(status.dataset.kind, kind);
     assert.match(dom.calls[1].url, /^\/oauth\/callback\?code=abc&state=def$/);
   }
+});
+
+test("a redirect answered by the proxy is reported as not having reached DSH", async () => {
+  // The submitted request and the confirmation probe are both redirected: the proxy in
+  // front of DSH answered, so the code never arrived and the panel must not say "done".
+  const dom = await boot([
+    { status: 400, type: "basic" },
+    { status: 0, type: "opaqueredirect" },
+    { status: 0, type: "opaqueredirect" },
+  ]);
+  textarea(dom.document).value = "http://127.0.0.1:47821/oauth/callback?code=abc&state=def";
+  submitButton(dom.document).click();
+  await settle();
+  await settle();
+  const status = statusLine(dom.document);
+  assert.match(status.textContent, /代理或 SSO/);
+  assert.equal(status.dataset.kind, "error");
+  assert.doesNotMatch(status.textContent, /登录完成/);
 });
 
 test("the panel refuses anything that is not this sign-in's callback address", async () => {

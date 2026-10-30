@@ -11,9 +11,15 @@
  * registered at all and the fallback seat answers 404. So the probe is free of side
  * effects and needs no API of ours.
  *
- * The extraction and the status vocabulary are intentionally duplicated in
- * assets/bridge.html (the standalone fallback): each file has to stand on its own, and
- * test/inpage.test.mjs plus test/bridge-page.test.mjs exercise both.
+ * Only those two answers are read as state. A redirect is deliberately *not*: upstream
+ * answers the request that carries the code with its own redirect, and this probe never
+ * carries one, so a redirect here comes from whatever sits in front of DSH (an SSO or
+ * reverse proxy answering an unauthenticated request). Treating that as "somebody
+ * finished the sign-in" made the panel appear unasked, claiming the login was done,
+ * whenever the operator's proxy session had lapsed.
+ *
+ * The extraction and the status vocabulary are exercised by test/inpage.test.mjs, which
+ * runs this file against a small DOM stub: no browser, no build step.
  */
 (function () {
   "use strict";
@@ -103,6 +109,24 @@
     if (status === null) return;
     status.textContent = text;
     status.dataset.kind = kind || "";
+  }
+
+  /** Is this answer a redirect? `redirect: "manual"` hides it behind an opaque type. */
+  function isRedirect(response) {
+    return response.type === "opaqueredirect" || (response.status >= 300 && response.status < 400);
+  }
+
+  /**
+   * Nothing is waiting (or nothing can be seen): forget a dismissal and hide. A panel
+   * that is showing the completion message owns the screen until its own timer hides it.
+   */
+  function goIdle() {
+    if (succeeded) return;
+    if (waiting) {
+      waiting = false;
+      dismissed = false;
+    }
+    hide();
   }
 
   /** Build the panel once; later calls only toggle it. */
@@ -244,10 +268,11 @@
       headers: { accept: "text/html" },
     })
       .then(function (response) {
-        if (response.type === "opaqueredirect" || (response.status >= 300 && response.status < 400)) {
-          succeeded = true;
-          setStatus(t("Signed in — you can close this.", "登录完成——可以关掉了。"), "ok");
-          setTimeout(hide, 6000);
+        if (isRedirect(response)) {
+          // Ambiguous, and `redirect: "manual"` hides what the redirect pointed at: this
+          // is either the platform completing the sign-in or the proxy/SSO in front of
+          // DSH answering before the request arrived. One more probe decides it.
+          confirmCompleted();
           return;
         }
         if (response.status >= 200 && response.status < 300) {
@@ -272,8 +297,43 @@
   }
 
   /**
+   * Tell a completion redirect apart from a proxy one.
+   *
+   * Upstream registers `/oauth/callback` exactly while an attempt waits, so a probe that
+   * is redirected too means that route was never reached: the redirect came from the SSO
+   * or reverse proxy in front of DSH, the code went nowhere, and claiming success would
+   * be a lie. A probe that answers at all (400 while the attempt is still being disposed,
+   * 404 once it is gone) means DSH itself answered the completion.
+   */
+  function confirmCompleted() {
+    fetch(CALLBACK, { method: "GET", credentials: "same-origin", redirect: "manual", cache: "no-store" })
+      .then(function (response) {
+        if (isRedirect(response)) {
+          setStatus(
+            t(
+              "The request was answered by the proxy or SSO in front of DSH, not by DSH: the sign-in did not go through. Reload the page (sign in to the proxy again if it asks), then retry.",
+              "这次请求是 DSH 前面的代理或 SSO 应答的，没有到过 DSH，登录没有完成。刷新页面（按提示重新过一遍代理登录）后重试。",
+            ),
+            "error",
+          );
+          button.disabled = false;
+          return;
+        }
+        succeeded = true;
+        setStatus(t("Signed in — you can close this.", "登录完成——可以关掉了。"), "ok");
+        setTimeout(hide, 6000);
+      })
+      .catch(function () {
+        setStatus(t("The request did not reach DSH.", "请求没有到达 DSH。"), "error");
+        button.disabled = false;
+      });
+  }
+
+  /**
    * One probe: 400 means an attempt is waiting (upstream's callback route exists and
    * rejected a request without code/state); 404 means it does not exist at all.
+   * Anything else — a redirect in particular — says nothing about the sign-in and is
+   * read as "not waiting", never as "signed in".
    */
   function probe() {
     if (document.visibilityState === "hidden") {
@@ -282,14 +342,11 @@
     }
     fetch(CALLBACK, { method: "GET", credentials: "same-origin", redirect: "manual", cache: "no-store" })
       .then(function (response) {
-        if (response.type === "opaqueredirect" || (response.status >= 300 && response.status < 400)) {
-          // Something just completed (another tab, or the standalone page).
-          if (!succeeded) {
-            succeeded = true;
-            show();
-            setStatus(t("Signed in — you can close this.", "登录完成——可以关掉了。"), "ok");
-            setTimeout(hide, 8000);
-          }
+        if (isRedirect(response)) {
+          // Upstream answers the request carrying the code with its redirect; this probe
+          // carries none, so an SSO or reverse proxy in front of DSH answered instead.
+          // Nothing happened to the sign-in: keep the panel out of the way.
+          goIdle();
           return;
         }
         if (response.status === 400) {
@@ -298,20 +355,16 @@
             dismissed = false;
             succeeded = false;
             if (input !== null) input.value = "";
+            // A new attempt must not inherit the previous attempt's answer.
+            setStatus("", "");
           }
           if (!dismissed) show();
           return;
         }
         // 404 and anything else: no attempt is waiting.
-        if (waiting) {
-          waiting = false;
-          dismissed = false;
-        }
-        hide();
+        goIdle();
       })
-      .catch(function () {
-        hide();
-      })
+      .catch(goIdle)
       .then(function () {
         schedule(waiting ? WAITING_MS : IDLE_MS);
       });

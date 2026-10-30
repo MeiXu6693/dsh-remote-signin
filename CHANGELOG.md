@@ -2,6 +2,23 @@
 
 Versions are what the `dsh-unraid` image pins, so a tag here is a deployment there.
 
+## 0.2.2 — 2026-10-30
+
+* **The panel no longer appears by itself and claims a sign-in it did not see.** Behind
+  an SSO or reverse proxy (this deployment: SWAG + Authelia) an unauthenticated request
+  is answered with a redirect, and a browser's `fetch(…, redirect: "manual")` reports any
+  redirect as an opaque one. The probe read that as "another tab just finished the
+  sign-in", so whenever the operator's proxy session had lapsed the panel popped up with
+  "Signed in — you can close this." although nobody had pressed Sign in. Measured on this
+  host: 171 `302`s on `GET /oauth/callback` in the SWAG access log, and **zero** `400`s
+  (the only answer that means an attempt is waiting) since 2026-10-25. A redirect is now
+  read as "cannot see the sign-in state", i.e. not waiting; only `400` shows the panel.
+* A pasted code whose completion is answered by a redirect is now confirmed with one more
+  probe: if the callback route redirects that probe too, the request never reached DSH
+  (the proxy answered) and the panel says so instead of reporting success.
+* A new attempt starts with an empty status line; it used to inherit the previous
+  attempt's answer, so a completed sign-in's "you can close this" could reappear later.
+
 ## 0.2.1 — 2026-10-16
 
 * The panel is styled from the harness design tokens (`--dsw-*`, declared by
