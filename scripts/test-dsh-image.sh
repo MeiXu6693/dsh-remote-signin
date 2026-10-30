@@ -21,6 +21,43 @@ port_for() {
     node -e 'const s = require("node:net").createServer(); s.listen(0,"127.0.0.1",() => {console.log(s.address().port);s.close()})'
 }
 
+# The activation line is the only proof the plugin applied. DSH prints it, not the
+# entrypoint, so a container can answer /healthz a moment before the line exists —
+# the health of Caddy is not the health of the plugin. Poll instead of grepping once;
+# a normal boot answers on the first poll, so this costs nothing then.
+ACTIVATION_TIMEOUT_S=20
+
+# What a red run leaves behind. A public CI job must not upload the one-time bootstrap
+# credentials DSH prints to its own log, so this is deliberately not the whole log: the
+# entrypoint's and the plugin's own lines, the process state, and what the app user can
+# actually read and import.
+diagnose() {
+    local name="$1" mode="$2"
+    printf -- '--- %s: evidence\n' "${mode}" >&2
+    docker inspect --format 'status={{.State.Status}} exit={{.State.ExitCode}} mounts={{json .Mounts}}' "${name}" >&2 || true
+    printf -- '--- entrypoint and plugin entries\n' >&2
+    docker logs "${name}" 2>&1 | grep -E '\[remote-signin\]|\[entrypoint\]' >&2 || true
+    printf -- '--- the plugin as the app user (uid 1000)\n' >&2
+    docker exec --user 1000 "${name}" sh -c 'ls -ln /app/node_modules/dsh-remote-signin /app/node_modules/dsh-remote-signin/src' >&2 || true
+    docker exec --user 1000 "${name}" node -e '
+        import("/app/node_modules/dsh-remote-signin/src/index.js")
+            .then((module) => console.log("import ok:", module.name))
+            .catch((error) => console.log("import failed:", error?.code ?? "", error?.message ?? error));
+    ' >&2 || true
+}
+
+wait_for_activation() {
+    local name="$1" waited=0
+    while (( waited < ACTIVATION_TIMEOUT_S * 5 )); do
+        if docker logs "${name}" 2>&1 | grep -q '\[remote-signin\] active.*claim http://127\.0\.0\.1:'; then
+            return 0
+        fi
+        sleep 0.2
+        waited=$(( waited + 1 ))
+    done
+    return 1
+}
+
 run_case() {
     local mode="$1" port name url status ready=0
     port="$(port_for)"; name="${PREFIX}-${mode}"; url="http://127.0.0.1:${port}"
@@ -42,9 +79,7 @@ run_case() {
         sleep 2
     done
     if [[ "${ready}" != 1 ]]; then
-        # Logs may include one-time bootstrap credentials. Keep diagnostics to
-        # process status rather than uploading container logs to a public CI job.
-        docker inspect --format '{{.State.Status}} exit={{.State.ExitCode}}' "${name}" >&2 || true
+        diagnose "${name}" "${mode}"
         fail "${mode}: container did not become healthy"
     fi
 
@@ -59,8 +94,9 @@ run_case() {
         printf 'ok %s: plugin disabled and panel unavailable\n' "${mode}"
         return
     fi
-    if ! docker logs "${name}" 2>&1 | grep -q '\[remote-signin\] active.*claim http://127\.0\.0\.1:'; then
-        fail "${mode}: plugin did not report an active loopback claim"
+    if ! wait_for_activation "${name}"; then
+        diagnose "${name}" "${mode}"
+        fail "${mode}: plugin did not report an active loopback claim within ${ACTIVATION_TIMEOUT_S}s"
     fi
     status="$(code --user "dsh:${PASSWORD}" "${url}/remote-signin/inpage.js")"
     [[ "${status}" == 200 ]] || fail "${mode}: panel returned ${status}"
