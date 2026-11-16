@@ -32,7 +32,7 @@ export { DEFAULT_CLAIM_ORIGIN, isLoopbackCallbackOrigin, mapCallbackOrigin, norm
 /** Marks the wrapper so the startup check can find it through a tracing accessor. */
 const WRAPPER = Symbol.for("dsh.remote-signin.wrapper");
 
-/** The counter the live wrapper moves, found again when a profile reload re-applies. */
+/** The tracker the live wrapper reports to, found again when a profile reload re-applies. */
 const ATTEMPTS = Symbol.for("dsh.remote-signin.attempts");
 
 /** The panel script the document injects. */
@@ -48,10 +48,16 @@ export const PANEL_PATH = "/remote-signin/inpage.js";
  * in flight: go look at the callback) or `204` (nothing is), so an idle page makes no
  * request any devtools would flag.
  *
- * It reports what this plugin can actually see: `startSignIn` is async and its promise
- * settles when the attempt ends (code accepted, expired, or failed), so the number of
- * in-flight calls is exactly "an attempt may be waiting". Nothing sensitive is involved
- * — the answer says only that a sign-in is in progress.
+ * What it reports depends on the upstream it runs against. Up to dsh 0.2.1 the
+ * `startSignIn` promise stayed pending for the whole attempt, so "a call is pending"
+ * was the answer. dsh 0.2.2 returns the account state as soon as the attempt is
+ * created (measured 2026-11-16, dsh-deepseek-account 0.2.2-rc.3: `return
+ * this.getState()` right after `this.attempt = attempt`), so the promise settles
+ * immediately and the call counter alone reads `204` for an attempt that is in fact
+ * waiting — which is the bug this version fixes. Once a call has been seen, the route
+ * therefore asks `deepseekAccount.getState()` for the attempt phase; `204` before any
+ * call is seen, so an idle page still costs nothing. Nothing sensitive is involved —
+ * the answer says only that a sign-in is in progress.
  */
 export const STATE_PATH = "/remote-signin/state";
 
@@ -99,28 +105,62 @@ function servePanel(body) {
   };
 }
 
+/** The phases upstream reports while an attempt may still be waiting for the browser. */
+const ACTIVE_PHASES = new Set([
+  "initializing",
+  "waiting-browser",
+  "exchanging",
+  "committing",
+]);
+
 /**
- * Count sign-ins that are in flight.
+ * Track whether a sign-in may be waiting.
  *
- * Upstream's `startSignIn` is async and resolves only when the attempt finishes, so a
- * counter moved on entry and on settle is the panel's cheapest honest answer to "may one
- * be waiting?". A non-promise return (an upstream that stops being async) is counted for
- * one poll only: the panel then falls back to reading the callback route itself, which
- * is what it did before this route existed.
+ * Two signals, because upstream changed shape underneath this plugin:
  *
- * @returns `{ begin, end, waiting }`.
+ *   1. The `startSignIn` promise. dsh ≤ 0.2.1 keeps it pending until the attempt
+ *      settles, so a positive count answers "yes" synchronously and costs nothing.
+ *   2. `deepseekAccount.getState()` once a call has been seen. dsh 0.2.2 resolves the
+ *      promise immediately, so the count is back to zero while the attempt is still
+ *      waiting; the phase in the service state is then the only honest answer.
+ *
+ * The state is only read while armed (a call happened and the last read still showed an
+ * active attempt), so a page that never signs in makes no extra work. A service without
+ * `getState`, or a state read that throws, fails soft to `false`: the panel stays
+ * hidden instead of claiming an attempt it cannot prove.
+ *
+ * @param service - the `deepseekAccount` service the wrapper was installed on.
+ * @returns `{ begin, end, active, activeSync }`.
  */
-function createAttempts() {
+function createAttempts(service) {
   let inFlight = 0;
+  let armed = false;
   return {
     begin() {
       inFlight += 1;
+      armed = true;
     },
     end() {
+      // dsh 0.2.2 settles here right after the attempt was created: keep `armed`,
+      // the phase read is what ends the attempt now.
       inFlight = Math.max(0, inFlight - 1);
     },
-    waiting() {
+    /** The synchronous answer for the pending-call shape (dsh ≤ 0.2.1). */
+    activeSync() {
       return inFlight > 0;
+    },
+    /** The asynchronous answer for the resolved-call shape (dsh 0.2.2+). */
+    async active() {
+      if (inFlight > 0) return true;
+      if (!armed) return false;
+      try {
+        const state = await service.getState();
+        const active = ACTIVE_PHASES.has(state?.attempt?.phase);
+        if (!active) armed = false;
+        return active;
+      } catch {
+        return false;
+      }
     },
   };
 }
@@ -131,7 +171,7 @@ function createAttempts() {
  * Status alone carries the answer, so the panel never parses a body and a proxy cannot
  * turn an idle page into a console error.
  *
- * @param attempts - the in-flight counter from {@link createAttempts}.
+ * @param attempts - the tracker from {@link createAttempts}.
  * @returns a webServer route handler.
  */
 function serveState(attempts) {
@@ -140,11 +180,18 @@ function serveState(attempts) {
       res.writeHead(405, { allow: "GET, HEAD", "cache-control": "no-store" }).end();
       return;
     }
-    res.writeHead(attempts.waiting() ? 200 : 204, {
-      "cache-control": "no-store",
-      "x-content-type-options": "nosniff",
-    });
-    res.end();
+    const answer = (waiting) => {
+      res.writeHead(waiting ? 200 : 204, {
+        "cache-control": "no-store",
+        "x-content-type-options": "nosniff",
+      });
+      res.end();
+    };
+    if (attempts.activeSync()) {
+      answer(true);
+      return;
+    }
+    return attempts.active().then(answer, () => answer(false));
   };
 }
 
@@ -160,10 +207,9 @@ function serveState(attempts) {
  *
  * @param ctx - Cordis context carrying the account service.
  * @param claim - normalized claim origin.
- * @returns the in-flight counter when the wrapper is in place, null when it is not.
+ * @returns the attempt tracker when the wrapper is in place, null when it is not.
  */
 function claimSignIn(ctx, claim) {
-  const attempts = createAttempts();
   let service;
   try {
     service = ctx.deepseekAccount;
@@ -174,6 +220,7 @@ function claimSignIn(ctx, claim) {
     console.error("[remote-signin] the deepseekAccount service is unavailable; remote sign-in stays off");
     return null;
   }
+  const attempts = createAttempts(service);
 
   const prototype = Object.getPrototypeOf(service);
   const original = typeof prototype?.startSignIn === "function" ? prototype.startSignIn : service.startSignIn;
@@ -184,9 +231,9 @@ function claimSignIn(ctx, claim) {
   // apply's route may already have been disposed with its plugin instance.
   if (original?.[WRAPPER] === true) {
     console.log(`[remote-signin] the account service is already claimed (${claim}); keeping the existing wrapper`);
-    // The live wrapper counts into the counter it was installed with, so a second apply
-    // (a profile reload, which replaces this plugin instance and would otherwise create a
-    // fresh counter) must serve *that* one — a new counter would always read zero.
+    // The live wrapper reports through the tracker it was installed with, so a second
+    // apply (a profile reload, which replaces this plugin instance and would otherwise
+    // create a fresh tracker) must serve *that* one — a fresh one would read 204.
     return original[ATTEMPTS] ?? attempts;
   }
 
@@ -250,7 +297,7 @@ function claimSignIn(ctx, claim) {
  *
  * @param ctx - Cordis context.
  * @param panel - the panel script, read once at apply time.
- * @param attempts - the in-flight counter the patched `startSignIn` moves.
+ * @param attempts - the tracker the patched `startSignIn` reports to.
  */
 function serveAndInject(ctx, panel, attempts) {
   ctx.inject(["webServer"], (webCtx) => {

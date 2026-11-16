@@ -21,6 +21,11 @@ function fakeContext() {
       this.calls.push({ client, callbackOrigin, loginSource });
       return this.answer ?? { ok: true };
     }
+    /** What upstream reports for /remote-signin/state; tests set the phase. */
+    state = { status: "signed-out", attempt: null };
+    getState() {
+      return this.state;
+    }
   }
   const service = new FakeAccount();
   const routes = new Map();
@@ -113,7 +118,7 @@ test("the state route reports an attempt only while a sign-in is in flight", asy
   const state = routes.get(STATE_PATH);
 
   const idle = fakeResponse();
-  state.handler({ method: "GET" }, idle);
+  await state.handler({ method: "GET" }, idle);
   assert.equal(idle.written.status, 204, "no attempt in flight answers 204, so an idle page has nothing to log");
   assert.equal(idle.written.headers["cache-control"], "no-store");
 
@@ -123,18 +128,56 @@ test("the state route reports an attempt only while a sign-in is in flight", asy
   });
   const inFlight = service.startSignIn({}, "https://dsh.example.com", "web");
   const waiting = fakeResponse();
-  state.handler({ method: "GET" }, waiting);
+  await state.handler({ method: "GET" }, waiting);
   assert.equal(waiting.written.status, 200, "an attempt in flight makes the panel read the callback");
 
   settle({ ok: true });
   await inFlight;
   const after = fakeResponse();
-  state.handler({ method: "GET" }, after);
+  await state.handler({ method: "GET" }, after);
   assert.equal(after.written.status, 204, "the attempt ended, so the answer goes back to 204");
 
   const post = fakeResponse();
-  state.handler({ method: "POST" }, post);
+  await state.handler({ method: "POST" }, post);
   assert.equal(post.written.status, 405);
+});
+
+test("the state route sees an attempt that outlives a resolved startSignIn promise", async () => {
+  // dsh 0.2.2 returns the account state as soon as the attempt exists, so the promise
+  // settles while the attempt is still waiting. Counting pending calls alone would
+  // answer 204 and the paste panel would never appear — the bug this test pins.
+  const { ctx, service, routes } = fakeContext();
+  apply(ctx, { claimOrigin: "http://127.0.0.1:47821" });
+  const state = routes.get(STATE_PATH);
+
+  let phase = "waiting-browser";
+  service.getState = async () => ({ status: "signed-out", attempt: { id: "attempt-1", phase } });
+  service.answer = Promise.resolve({ ok: true });
+  await service.startSignIn({}, "https://dsh.example.com", "web");
+
+  const waiting = fakeResponse();
+  await state.handler({ method: "GET" }, waiting);
+  assert.equal(waiting.written.status, 200, "a resolved startSignIn must not hide the waiting attempt");
+
+  phase = "expired";
+  const after = fakeResponse();
+  await state.handler({ method: "GET" }, after);
+  assert.equal(after.written.status, 204, "the attempt ended, so the answer goes back to 204");
+
+  const post = fakeResponse();
+  await state.handler({ method: "POST" }, post);
+  assert.equal(post.written.status, 405);
+});
+
+test("a service without getState fails soft instead of claiming an attempt", async () => {
+  const { ctx, service, routes } = fakeContext();
+  apply(ctx, { claimOrigin: "http://127.0.0.1:47821" });
+  delete service.getState;
+  service.answer = Promise.resolve({ ok: true });
+  await service.startSignIn({}, "https://dsh.example.com", "web");
+  const state = fakeResponse();
+  await routes.get(STATE_PATH).handler({ method: "GET" }, state);
+  assert.equal(state.written.status, 204, "no state to read means no claim, and no page error");
 });
 
 test("a live profile reload keeps the counter the installed wrapper moves", async () => {
@@ -148,7 +191,7 @@ test("a live profile reload keeps the counter the installed wrapper moves", asyn
   });
   const inFlight = service.startSignIn({}, "https://dsh.example.com", "web");
   const state = fakeResponse();
-  routes.get(STATE_PATH).handler({ method: "GET" }, state);
+  await routes.get(STATE_PATH).handler({ method: "GET" }, state);
   assert.equal(state.written.status, 200, "a fresh counter in the second apply would always read 204");
   settle({ ok: true });
   await inFlight;

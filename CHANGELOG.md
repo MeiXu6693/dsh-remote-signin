@@ -2,6 +2,23 @@
 
 Versions are what the `dsh-unraid` image pins, so a tag here is a deployment there.
 
+## 0.2.4 — 2026-11-16
+
+* **The paste panel appears again on dsh 0.2.2 and later.** Upstream 0.2.2 returns the
+  account state as soon as the attempt is created (`return this.getState()` right after
+  `this.attempt = attempt`) instead of keeping the `startSignIn` promise pending until
+  the attempt ends. The plugin counted pending calls, so `/remote-signin/state` answered
+  `204` for an attempt that was in fact `waiting-browser`: measured on this host
+  2026-11-16, a login started 09:19:53 was answered with `204` at 09:24 and the attempt
+  survived until upstream reported `expired` at 09:29:53. The panel therefore never
+  appeared, and the browser that came back from the login page had nowhere to paste the
+  callback address. The state route now asks `deepseekAccount.getState()` for the
+  attempt phase once a sign-in call has been seen; a positive pending-call count still
+  answers synchronously on 0.2.1 and earlier, and a service without `getState` fails
+  soft to `204` instead of inventing an attempt.
+* An idle page still costs nothing: the phase is read only after a sign-in call, and the
+  reads stop as soon as the attempt is no longer active.
+
 ## 0.2.3 — 2026-10-30
 
 * **An idle page no longer makes a failing request every three seconds.** The panel used
