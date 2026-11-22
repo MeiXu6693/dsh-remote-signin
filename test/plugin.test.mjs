@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { PANEL_PATH, STATE_PATH, apply } from "../src/index.js";
+import { Readable, Writable } from "node:stream";
+import { BRIDGE_HEADER, CALLBACK_PATH, PANEL_PATH, STATE_PATH, apply, bridgeCallback } from "../src/index.js";
 
 /**
  * A Cordis context stub recording everything the plugin touches.
@@ -32,6 +33,11 @@ function fakeContext() {
   const effects = [];
   const listeners = new Map();
   const webServer = {
+    port: 3080,
+    protocol: "http:",
+    getOrigin() {
+      return `http://127.0.0.1:${this.port}`;
+    },
     register(route) {
       if (routes.has(route.path)) throw new Error(`duplicate route ${route.path}`);
       routes.set(route.path, route);
@@ -42,6 +48,10 @@ function fakeContext() {
     webServer,
     effect(factory, label) {
       effects.push({ label, dispose: factory() });
+      return () => {};
+    },
+    on(event, handler) {
+      (listeners.get(event) ?? listeners.set(event, []).get(event)).push(handler);
       return () => {};
     },
   };
@@ -58,25 +68,57 @@ function fakeContext() {
       for (const handler of listeners.get(event) ?? []) handler(table);
     },
   };
-  return { ctx, service, routes, effects, listeners };
+  return { ctx, service, routes, effects, listeners, webServer };
 }
 
-/** Minimal ServerResponse stand-in. */
+/**
+ * Minimal ServerResponse stand-in: a real Writable so the bridge can `pipe` the listener's
+ * body into it, with the recording the assertions read.
+ */
+class FakeResponse extends Writable {
+  constructor() {
+    super();
+    this.written = { status: 0, headers: {}, body: undefined, ended: false, destroyed: false };
+    this.finished = new Promise((resolve) => {
+      this.once("finish", resolve);
+      this.once("close", resolve);
+    });
+  }
+
+  get headersSent() {
+    return this.written.status !== 0;
+  }
+
+  writeHead(status, headers) {
+    this.written.status = status;
+    this.written.headers = headers ?? {};
+    return this;
+  }
+
+  _write(chunk, _encoding, callback) {
+    this.written.body = (this.written.body ?? "") + String(chunk);
+    callback();
+  }
+
+  end(chunk, encoding, callback) {
+    if (typeof chunk === "function") {
+      callback = chunk;
+      chunk = undefined;
+    }
+    if (chunk !== undefined && chunk !== null) this.written.body = (this.written.body ?? "") + String(chunk);
+    this.written.ended = true;
+    // The chunk was recorded above; handing it to the Writable again would double it.
+    return super.end(undefined, undefined, callback);
+  }
+
+  destroy(error) {
+    this.written.destroyed = true;
+    return super.destroy(error);
+  }
+}
+
 function fakeResponse() {
-  const written = { status: 0, headers: {}, body: undefined, ended: false };
-  return {
-    written,
-    writeHead(status, headers) {
-      written.status = status;
-      written.headers = headers ?? {};
-      return this;
-    },
-    end(body) {
-      written.body = body;
-      written.ended = true;
-      return this;
-    },
-  };
+  return new FakeResponse();
 }
 
 test("apply claims a remote origin, leaves loopback alone, and serves the panel", () => {
@@ -249,4 +291,163 @@ test("REMOTE_SIGNIN_ORIGIN is honoured and config wins over it", () => {
     if (previous === undefined) delete process.env.REMOTE_SIGNIN_ORIGIN;
     else process.env.REMOTE_SIGNIN_ORIGIN = previous;
   }
+});
+
+test("apply registers the callback bridge as a listener, never as a route", () => {
+  const { ctx, routes, listeners } = fakeContext();
+  apply(ctx, { claimOrigin: "http://127.0.0.1:47821" });
+  // A route at this path would collide with upstream's own registration on 0.2.2
+  // ("duplicate (kind, path)") and break the sign-in this plugin exists to rescue.
+  assert.deepEqual([...routes.keys()].sort(), [PANEL_PATH, STATE_PATH].sort());
+  assert.equal(
+    (listeners.get("webserver/request") ?? []).length,
+    1,
+    "the bridge has to be a webserver/request listener",
+  );
+});
+
+/** A fake listener response stream, relayed by the bridge. */
+function fakeAnswer({ status = 400, headers = { "cache-control": "no-store" }, body = "invalid state" } = {}) {
+  const answer = Readable.from([Buffer.from(body)]);
+  answer.statusCode = status;
+  answer.headers = headers;
+  return answer;
+}
+
+/** A fake transport recording the options the bridge builds. */
+function fakeTransport({ answer = fakeAnswer(), fail } = {}) {
+  const calls = [];
+  const transport = (options, onResponse) => {
+    calls.push(options);
+    const handlers = new Map();
+    return {
+      on(event, handler) {
+        handlers.set(event, handler);
+        return this;
+      },
+      end() {
+        if (fail !== undefined) {
+          handlers.get("error")?.(fail);
+          return;
+        }
+        onResponse(answer);
+      },
+    };
+  };
+  return { transport, calls };
+}
+
+/** Dispatch one request through the bridge the way the web server would. */
+function dispatch(bridge, request) {
+  const response = fakeResponse();
+  let nextCalls = 0;
+  bridge(request, response, () => {
+    nextCalls += 1;
+  });
+  return { response, next: () => nextCalls };
+}
+
+const CLAIM = "http://127.0.0.1:47821";
+
+test("the bridge replays the browser's callback with the claimed Host and relays the answer", async () => {
+  const { webServer } = fakeContext();
+  const { transport, calls } = fakeTransport({ answer: fakeAnswer({ status: 410, body: "gone" }) });
+  const bridge = bridgeCallback(CLAIM, webServer, transport);
+
+  const request = dispatch(bridge, {
+    method: "GET",
+    url: "/oauth/callback?code=abc&state=def",
+    headers: { host: "dsh.example.com", accept: "text/html" },
+  });
+  await request.response.finished;
+
+  assert.equal(calls.length, 1, "the callback has to be replayed exactly once");
+  assert.deepEqual(calls[0], {
+    protocol: "http:",
+    hostname: "127.0.0.1",
+    port: "3080",
+    method: "GET",
+    // The panel's own path and query, never a URL taken from the request.
+    path: "/oauth/callback?code=abc&state=def",
+    headers: { host: "127.0.0.1:47821", accept: "text/html", [BRIDGE_HEADER]: "1" },
+  });
+  // The listener's answer reaches the panel unchanged, status and headers included.
+  assert.equal(request.response.written.status, 410);
+  assert.equal(request.response.written.headers["cache-control"], "no-store");
+  assert.equal(request.response.written.body, "gone");
+  assert.equal(request.next(), 0, "the bridge owns the callback response");
+});
+
+test("the bridge falls through for its own replay, for other paths, and for wrong methods", async () => {
+  const { webServer } = fakeContext();
+
+  // A replay that nobody consumed: falling through lets DSH answer its own 404 instead of
+  // looping, which is what an idle page has to see.
+  const replay = fakeTransport();
+  const replayBridge = bridgeCallback(CLAIM, webServer, replay.transport);
+  const marked = dispatch(replayBridge, {
+    method: "GET",
+    url: "/oauth/callback?code=abc&state=def",
+    headers: { host: "127.0.0.1:47821", [BRIDGE_HEADER]: "1" },
+  });
+  assert.equal(marked.next(), 1, "a replay must never be replayed again");
+  assert.equal(replay.calls.length, 0);
+
+  const other = fakeTransport();
+  const otherBridge = bridgeCallback(CLAIM, webServer, other.transport);
+  for (const url of ["/", "/api/settings.describe", "/remote-signin/inpage.js", "/notoauth/callback"]) {
+    assert.equal(dispatch(otherBridge, { method: "GET", url, headers: {} }).next(), 1, `expected ${url} to fall through`);
+  }
+  assert.equal(other.calls.length, 0);
+
+  const post = fakeTransport();
+  const postBridge = bridgeCallback(CLAIM, webServer, post.transport);
+  const refused = dispatch(postBridge, { method: "POST", url: "/oauth/callback", headers: {} });
+  assert.equal(refused.response.written.status, 405);
+  assert.equal(refused.response.written.headers.allow, "GET, HEAD");
+  assert.equal(post.calls.length, 0, "only GET and HEAD are replayed");
+});
+
+test("the bridge fails soft when the listener is gone or unknown", async () => {
+  const { webServer } = fakeContext();
+
+  const refused = fakeTransport({
+    fail: Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:3080"), { code: "ECONNREFUSED" }),
+  });
+  const bridge = bridgeCallback(CLAIM, webServer, refused.transport);
+  const failed = dispatch(bridge, { method: "GET", url: "/oauth/callback?code=a&state=b", headers: {} });
+  await failed.response.finished;
+  assert.equal(failed.response.written.status, 502, "a dead listener is a bad gateway, not a thrown boot");
+  assert.match(failed.response.written.body, /ECONNREFUSED/);
+  assert.equal(failed.next(), 0);
+
+  // A webServer that cannot say where it listens answers 503 instead of guessing.
+  const unknown = bridgeCallback(CLAIM, {}, fakeTransport().transport);
+  const guessed = dispatch(unknown, { method: "GET", url: "/oauth/callback?code=a&state=b", headers: {} });
+  assert.equal(guessed.response.written.status, 503);
+});
+
+test("the bridge dials a wildcard bind through loopback and falls back to the port", async () => {
+  const wildcard = fakeContext().webServer;
+  wildcard.getOrigin = () => "http://0.0.0.0:3080";
+  const first = fakeTransport();
+  dispatch(bridgeCallback(CLAIM, wildcard, first.transport), {
+    method: "HEAD",
+    url: "/oauth/callback?code=a&state=b",
+    headers: {},
+  });
+  assert.equal(first.calls[0].hostname, "127.0.0.1", "a connect to 0.0.0.0 is not portable");
+  assert.equal(first.calls[0].method, "HEAD");
+
+  // No getOrigin (an older webServer): the port alone is enough.
+  const second = fakeTransport();
+  dispatch(bridgeCallback(CLAIM, { port: 3099 }, second.transport), {
+    method: "GET",
+    url: "/oauth/callback?code=a&state=b",
+    headers: {},
+  });
+  assert.deepEqual(
+    { protocol: second.calls[0].protocol, hostname: second.calls[0].hostname, port: second.calls[0].port },
+    { protocol: "http:", hostname: "127.0.0.1", port: "3099" },
+  );
 });

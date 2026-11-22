@@ -5,7 +5,8 @@
  * The plugin is two parts; this file is the server half.
  *
  *   src/index.js      this file: claims the loopback redirect, serves the panel script
- *                     and the attempt state it polls, and injects the panel into the
+ *                     and the attempt state it polls, replays the callback the panel
+ *                     collects to DSH's own listener, and injects the panel into the
  *                     DSH page.
  *   assets/inpage.js  the panel itself: appears while a sign-in waits, takes the pasted
  *                     callback address, and reports what the server answered.
@@ -21,6 +22,8 @@
  */
 
 import { readFileSync } from "node:fs";
+import http from "node:http";
+import https from "node:https";
 import { DEFAULT_CLAIM_ORIGIN, mapCallbackOrigin, normalizeClaimOrigin } from "./claim.js";
 
 export const name = "remote-signin";
@@ -37,6 +40,15 @@ const ATTEMPTS = Symbol.for("dsh.remote-signin.attempts");
 
 /** The panel script the document injects. */
 export const PANEL_PATH = "/remote-signin/inpage.js";
+
+/** Upstream's completion route, on this origin, as the panel asks for it. */
+export const CALLBACK_PATH = "/oauth/callback";
+
+/**
+ * Marks the replay the bridge sends to DSH's own listener, so the bridge can recognise
+ * its own request and never replay it again.
+ */
+export const BRIDGE_HEADER = "x-dsh-remote-signin-bridge";
 
 /**
  * "May a sign-in be waiting right now?" — the panel's quiet poll.
@@ -291,6 +303,151 @@ function claimSignIn(ctx, claim) {
 }
 
 /**
+ * Where DSH's own listener answers: the loopback address the panel's request has to reach
+ * as a *server-side* request, because the browser's own Host can never be the claimed one.
+ *
+ * `getOrigin()` is preferred (it carries the listener's protocol and assigned port, even
+ * when the port came from the OS); a wildcard bind is dialled through loopback because a
+ * connect to 0.0.0.0/:: is not portable.
+ *
+ * @param webServer - the `webServer` service.
+ * @returns `{ protocol, hostname, port }`, or undefined when the listener is unknown.
+ */
+function listenerTarget(webServer) {
+  try {
+    if (typeof webServer?.getOrigin === "function") {
+      const origin = new URL(webServer.getOrigin());
+      const wildcard = ["0.0.0.0", "::", "[::]", ""].includes(origin.hostname);
+      return {
+        protocol: origin.protocol,
+        hostname: wildcard ? "127.0.0.1" : origin.hostname,
+        port: origin.port === "" ? (origin.protocol === "https:" ? 443 : 80) : origin.port,
+      };
+    }
+  } catch {
+    // fall through to the port
+  }
+  const port = webServer?.port;
+  if (typeof port !== "number" || port <= 0) return undefined;
+  return { protocol: webServer?.protocol === "https:" ? "https:" : "http:", hostname: "127.0.0.1", port: String(port) };
+}
+
+/**
+ * The one socket call the bridge makes. Named and swappable so the tests stay offline:
+ * everything else about the bridge is decided before this runs (`bridgeCallback` builds
+ * the options and relays whatever comes back).
+ *
+ * @param options - `{ protocol, hostname, port, method, path, headers }`.
+ * @param onResponse - receives the listener's response stream.
+ * @returns the client request, which the caller ends.
+ */
+export function replayRequest(options, onResponse) {
+  const client = options.protocol === "https:" ? https : http;
+  return client.request(options, onResponse);
+}
+
+/**
+ * Replay the panel's callback to DSH's own listener with the *claimed* Host.
+ *
+ * Upstream 0.2.3 stopped registering a `/oauth/callback` route. It registers a
+ * `webserver/request` listener while an attempt waits, and that listener accepts only a
+ * request whose `Host` is the claimed loopback origin (`attempt.origin`). A browser never
+ * sends that Host — claiming a loopback address for a browser that cannot reach it is the
+ * entire reason this plugin exists — so without a replay the panel's own `fetch()` would
+ * fall through to DSH's 404 and the code would never reach the waiting attempt.
+ * Measured 2026-11-22 against dsh-deepseek-account 0.2.3-alpha.2: the dispatch compares
+ * `new URL('http://' + req.headers.host)` with `attempt.origin`, so the replay below is
+ * exactly the shape it accepts. Upstream 0.2.2 and earlier ignored the Host on their
+ * exact route, which the same replay also satisfies — one bridge, both shapes.
+ *
+ * It is a middleware rather than a route on purpose: a route at this path would collide
+ * with upstream's own registration on 0.2.2 ("duplicate (kind, path)") and break the
+ * sign-in it is supposed to help. The replay carries a marker; a marked request falls
+ * through instead of being replayed again, so an attempt that has already ended ends as
+ * DSH's ordinary 404 instead of an endless loop.
+ *
+ * Nothing about upstream's validation is touched: the replayed request still has to pass
+ * its one-time `state` comparison and its PKCE exchange, and the answer — including its
+ * error codes — is relayed to the panel unchanged.
+ *
+ * @param claim - normalized loopback claim origin, e.g. `http://127.0.0.1:47821`.
+ * @param webServer - the `webServer` service, for the listener address.
+ * @param request - transport, injectable for tests.
+ * @returns a `webserver/request` listener.
+ */
+export function bridgeCallback(claim, webServer, request = replayRequest) {
+  let claimHost;
+  try {
+    claimHost = new URL(claim).host;
+  } catch {
+    claimHost = undefined;
+  }
+  return (req, res, next) => {
+    let url;
+    try {
+      url = new URL(req.url ?? "", "http://dsh.invalid");
+    } catch {
+      return next();
+    }
+    if (claimHost === undefined || url.pathname !== CALLBACK_PATH) return next();
+    // The replay itself. Upstream's listener owns it when an attempt waits, and DSH's own
+    // routing answers 404 when none does; either way it must not come back here.
+    if (req.headers?.[BRIDGE_HEADER] !== undefined) return next();
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      res.writeHead(405, { allow: "GET, HEAD", "cache-control": "no-store" }).end();
+      return;
+    }
+    const target = listenerTarget(webServer);
+    if (target === undefined) {
+      res.writeHead(503, { "cache-control": "no-store" }).end();
+      return;
+    }
+    let upstream;
+    try {
+      upstream = request(
+        {
+          ...target,
+          method: req.method,
+          // Only the path this middleware already matched: never a URL from the request.
+          path: `${url.pathname}${url.search}`,
+          headers: {
+            host: claimHost,
+            accept: req.headers?.accept ?? "*/*",
+            [BRIDGE_HEADER]: "1",
+          },
+        },
+        (answer) => {
+          const headers = { ...answer.headers };
+          // The body is relayed as it arrives; the client re-frames or closes it.
+          delete headers.connection;
+          delete headers["keep-alive"];
+          delete headers["transfer-encoding"];
+          res.writeHead(answer.statusCode ?? 502, headers);
+          answer.pipe(res);
+          answer.on("error", () => res.destroy?.());
+        },
+      );
+    } catch (error) {
+      console.error(`[remote-signin] the callback replay could not start: ${error?.message ?? error}`);
+      res.writeHead(502, { "cache-control": "no-store" }).end();
+      return;
+    }
+    upstream.on("error", (error) => {
+      // Measured shape of the failure an operator would otherwise read as "the sign-in is
+      // broken": the listener is gone, or this process is being replaced.
+      if (res.headersSent) {
+        res.destroy?.();
+        return;
+      }
+      res
+        .writeHead(502, { "cache-control": "no-store", "content-type": "text/plain; charset=utf-8" })
+        .end(`remote-signin: the sign-in callback did not reach DSH (${error?.code ?? "error"})\n`);
+    });
+    upstream.end();
+  };
+}
+
+/**
  * Serve the panel script, the attempt state it polls, and inject the panel into the DSH
  * document. The injection is what makes the flow automatic: the panel appears on its own
  * while a sign-in waits, so the operator never has to know a URL.
@@ -298,8 +455,9 @@ function claimSignIn(ctx, claim) {
  * @param ctx - Cordis context.
  * @param panel - the panel script, read once at apply time.
  * @param attempts - the tracker the patched `startSignIn` reports to.
+ * @param claim - the claimed loopback origin, for the callback bridge.
  */
-function serveAndInject(ctx, panel, attempts) {
+function serveAndInject(ctx, panel, attempts, claim) {
   ctx.inject(["webServer"], (webCtx) => {
     // Routes are a composition-level contract and a duplicate (kind, path) throws. A
     // duplicate means another instance of this plugin already serves the panel (a live
@@ -321,6 +479,21 @@ function serveAndInject(ctx, panel, attempts) {
           console.error(`[remote-signin] could not serve ${path}: ${error?.message ?? error}`);
         }
       }
+    }
+
+    // The callback bridge (see `bridgeCallback`). Fail soft like everything else here:
+    // without it the panel still appears and still reports what it gets, so a listener
+    // that cannot be registered costs one log line, never the boot.
+    try {
+      webCtx.effect(
+        () => webCtx.on("webserver/request", bridgeCallback(claim, webCtx.webServer)),
+        `remote-signin: ${CALLBACK_PATH} bridge`,
+      );
+    } catch (error) {
+      console.error(
+        `[remote-signin] could not bridge ${CALLBACK_PATH}: ${error?.message ?? error}; ` +
+          "a first-party browser can still finish the sign-in on this machine",
+      );
     }
   });
 
@@ -358,7 +531,7 @@ export function apply(ctx, config = {}) {
 
   const attempts = claimSignIn(ctx, claim);
   if (attempts === null) return;
-  serveAndInject(ctx, panel, attempts);
+  serveAndInject(ctx, panel, attempts, claim);
   console.log(`[remote-signin] active — v${VERSION}, claim ${claim}, panel at ${PANEL_PATH}`);
 }
 

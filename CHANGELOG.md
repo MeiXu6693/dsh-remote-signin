@@ -2,6 +2,26 @@
 
 Versions are what the `dsh-unraid` image pins, so a tag here is a deployment there.
 
+## 0.2.5 — 2026-11-22
+
+* **The panel completes a sign-in again on dsh 0.2.3 and later.** Upstream replaced its
+  `/oauth/callback` route with a request listener that accepts only a request whose `Host`
+  is the claimed loopback origin (`attempt.origin`) — measured 2026-11-22 on
+  `dsh-deepseek-account` 0.2.3-alpha.2, which compares
+  `new URL('http://' + req.headers.host)` against that origin. A browser that is not on
+  this machine can never present that Host, which is the reason this plugin exists: the
+  panel's same-origin `fetch()` fell through to DSH's 404 and the code never reached the
+  waiting attempt. Measured against the alpha: the panel's callback answered **404** with
+  0.2.4 and answers **400** (upstream's own one-time `state` check, i.e. the request
+  arrived) with this version. The plugin now replays exactly that path to DSH's own
+  listener with the claimed `Host` and relays the answer — status and headers included —
+  back to the panel.
+* The replay is marked, so a request nobody consumed ends as DSH's ordinary `404` instead
+  of being replayed again; the bridge is a request listener rather than a route, so it
+  cannot collide with the exact route upstream 0.2.2 and earlier register for the same
+  path; and it fails soft (one log line, `502`/`503` to the panel) when the listener is
+  unreachable. Upstream's one-time `state` comparison and its PKCE exchange are untouched.
+
 ## 0.2.4 — 2026-11-16
 
 * **The paste panel appears again on dsh 0.2.2 and later.** Upstream 0.2.2 returns the
