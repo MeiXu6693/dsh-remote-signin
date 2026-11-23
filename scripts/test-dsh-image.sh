@@ -98,9 +98,20 @@ run_case() {
         diagnose "${name}" "${mode}"
         fail "${mode}: plugin did not report an active loopback claim within ${ACTIVATION_TIMEOUT_S}s"
     fi
-    status="$(code --user "dsh:${PASSWORD}" "${url}/remote-signin/inpage.js")"
-    [[ "${status}" == 200 ]] || fail "${mode}: panel returned ${status}"
+    # The panel is a page resource. dsh 0.2.3 enforces the session on every authenticated
+    # route even from loopback: measured 2026-11-23, the same request that answered 200 on
+    # 0.2.2-rc.5 answers 401 on 0.2.3-alpha.2. Fetch the document first, the way the page
+    # does, and then ask for the panel with the session cookie that document minted —
+    # that shape holds on both images, and the credential-free check above still pins the
+    # gate itself.
+    curl --silent --show-error --fail --location --max-time 15 --user "dsh:${PASSWORD}" \
+        --cookie-jar "${WORKDIR}/${mode}.cookies" --cookie "${WORKDIR}/${mode}.cookies" \
+        "${url}/" > "${WORKDIR}/${mode}.html"
+    grep -q '/remote-signin/inpage.js' "${WORKDIR}/${mode}.html" || fail "${mode}: DSH document did not inject the panel"
+    status="$(code --user "dsh:${PASSWORD}" --cookie "${WORKDIR}/${mode}.cookies" "${url}/remote-signin/inpage.js")"
+    [[ "${status}" == 200 ]] || fail "${mode}: panel returned ${status} for the page session"
     curl --silent --show-error --fail --max-time 10 --user "dsh:${PASSWORD}" \
+        --cookie "${WORKDIR}/${mode}.cookies" \
         --dump-header "${WORKDIR}/${mode}.headers" --output "${WORKDIR}/${mode}.js" "${url}/remote-signin/inpage.js"
     grep -iq '^cache-control:.*no-store' "${WORKDIR}/${mode}.headers" || fail "${mode}: panel must be no-store"
     if [[ "${mode}" == bundled ]]; then
@@ -109,14 +120,10 @@ run_case() {
         cp "${ROOT}/assets/inpage.js" "${WORKDIR}/${mode}.expected"
     fi
     cmp -s "${WORKDIR}/${mode}.js" "${WORKDIR}/${mode}.expected" || fail "${mode}: panel bytes differ from plugin source"
-    curl --silent --show-error --fail --location --max-time 15 --user "dsh:${PASSWORD}" \
-        --cookie-jar "${WORKDIR}/${mode}.cookies" --cookie "${WORKDIR}/${mode}.cookies" \
-        "${url}/" > "${WORKDIR}/${mode}.html"
-    grep -q '/remote-signin/inpage.js' "${WORKDIR}/${mode}.html" || fail "${mode}: DSH document did not inject the panel"
     status="$(code --user "dsh:${PASSWORD}" "${url}/oauth/callback?code=fixture&state=fixture")"
     [[ "${status}" == 404 ]] || fail "${mode}: idle callback returned ${status}, expected 404"
     if [[ "${mode}" == edge ]]; then
-        status="$(code --user "dsh:${PASSWORD}" -H 'Origin: https://foreign.example' "${url}/remote-signin/inpage.js")"
+        status="$(code --user "dsh:${PASSWORD}" --cookie "${WORKDIR}/${mode}.cookies" -H 'Origin: https://foreign.example' "${url}/remote-signin/inpage.js")"
         [[ "${status}" == 403 ]] || fail "edge: foreign Origin returned ${status}, expected 403"
     fi
     printf 'ok %s: loaded, authenticated, panel injected and served, callback guarded\n' "${mode}"
